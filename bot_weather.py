@@ -14,6 +14,12 @@ from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, Optional, List, Tuple
 
 import aiohttp
+try:
+    import tornado.web
+    from telegram.ext._utils.webhookhandler import TelegramHandler
+except Exception:
+    tornado = None
+    TelegramHandler = None
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
@@ -25,9 +31,37 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 WEATHERAPI_KEY = os.getenv("WEATHERAPI_KEY")
 METEOBLUE_API_KEY = os.getenv("METEOBLUE_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://<project>.up.railway.app
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram-webhook")
+HEALTH_PATH = os.getenv("HEALTH_PATH", "/health")
+PORT = int(os.getenv("PORT", "8080"))
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "Fight club")
+ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")
+HEALTH_PATH_EFFECTIVE = HEALTH_PATH
 
-BOT_VERSION = "2.5"
+BOT_VERSION = "2.7"
 BOT_RELEASES = [
+    {
+        "version": "2.7",
+        "changes": [
+            "Endpoint /health per Railway/monitoraggio",
+            "Comando /admin con stato completo (errori, backoff, cache)",
+            "Supporto dominio webhook e path configurabili",
+        ],
+    },
+    {
+        "version": "2.6",
+        "changes": [
+            "Fallback automatico con cache anche se scaduta (stale)",
+            "Messaggi chiari quando un provider non risponde",
+            "Preferenze per unita (C/F, km/h/mph) e fascia notifiche",
+            "Logging strutturato errori API e retry",
+            "Test base per formattazione e fallback",
+            "Backoff intelligente per provider instabili",
+            "TTL forecast piu lungo nelle ore notturne",
+            "Stato backoff visibile in /info",
+        ],
+    },
     {
         "version": "2.5",
         "changes": [
@@ -125,6 +159,7 @@ PROVIDERS = ["OpenWeather", "WeatherAPI", "Meteoblue"]
 CACHE_TTL_CURRENT_MIN = 10
 CACHE_TTL_FORECAST_MIN = 30
 CACHE_TTL_GEOCODE_HOURS = 24
+NIGHT_FORECAST_TTL_MULT = 2
 
 # Rain threshold (%)
 RAIN_POP_THRESHOLD = 30
@@ -151,6 +186,11 @@ DAILY_CHECK_MIN = 0
 TOMORROW_RAIN_HOUR = 18
 TOMORROW_RAIN_WINDOW_MIN = 60
 OFFLINE_TEST_DAYS = 30
+
+DEFAULT_TEMP_UNIT = "C"
+DEFAULT_WIND_UNIT = "kmh"
+DEFAULT_ALERT_START_HOUR = 7
+DEFAULT_ALERT_END_HOUR = 22
 
 MSG_SERVICE_UNAVAILABLE = "Servizio temporaneamente non disponibile, riprova."
 MSG_CITY_NOT_FOUND = "Citta non trovata. Controlla il nome o usa /setcitta."
@@ -191,6 +231,140 @@ def md_escape(text: Optional[str]) -> str:
         s = s.replace(ch, "\\" + ch)
     return s
 
+def _parse_admin_ids(raw: str) -> set:
+    out = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+            continue
+    return out
+
+ADMIN_IDS_SET = _parse_admin_ids(ADMIN_USER_IDS)
+
+def is_admin(user_id: int, token: Optional[str] = None) -> bool:
+    if ADMIN_IDS_SET and user_id in ADMIN_IDS_SET:
+        return True
+    if ADMIN_SECRET and token and token == ADMIN_SECRET:
+        return True
+    return False
+
+class HealthHandler(tornado.web.RequestHandler if tornado else object):
+    def initialize(self, payload: Dict[str, Any]) -> None:
+        self.payload = payload
+
+    def get(self) -> None:
+        self.set_header("Content-Type", 'application/json; charset="utf-8"')
+        self.write(json.dumps(self.payload))
+
+class CustomWebhookApp(tornado.web.Application if tornado else object):
+    def __init__(
+        self,
+        webhook_path: str,
+        bot: Any,
+        update_queue: asyncio.Queue,
+        secret_token: str | None = None,
+    ):
+        if not webhook_path.startswith("/"):
+            webhook_path = f"/{webhook_path}"
+        health_path = HEALTH_PATH_EFFECTIVE
+        if not health_path.startswith("/"):
+            health_path = f"/{health_path}"
+        payload = {"status": "ok", "version": BOT_VERSION, "ts": iso(now_utc())}
+        shared = {"bot": bot, "update_queue": update_queue, "secret_token": secret_token}
+        handlers = [
+            (rf"{webhook_path}/?", TelegramHandler, shared),
+            (rf"{health_path}/?", HealthHandler, {"payload": payload}),
+        ]
+        tornado.web.Application.__init__(self, handlers)  # type: ignore
+
+def normalize_temp_unit(unit: Optional[str]) -> str:
+    if not unit:
+        return DEFAULT_TEMP_UNIT
+    u = str(unit).strip().lower()
+    return "F" if u in {"f", "fahrenheit"} else "C"
+
+def normalize_wind_unit(unit: Optional[str]) -> str:
+    if not unit:
+        return DEFAULT_WIND_UNIT
+    u = str(unit).strip().lower()
+    return "mph" if u in {"mph", "mi/h"} else "kmh"
+
+def temp_to_unit(temp_c: float, unit: str) -> float:
+    return (temp_c * 9 / 5) + 32 if unit == "F" else temp_c
+
+def temp_delta_to_unit(delta_c: float, unit: str) -> float:
+    return delta_c * 9 / 5 if unit == "F" else delta_c
+
+def wind_to_unit(wind_kph: float, unit: str) -> float:
+    return wind_kph * 0.621371 if unit == "mph" else wind_kph
+
+def format_temp(value_c: Optional[float], prefs: Optional[Dict[str, Any]] = None, decimals: int = 1) -> str:
+    if value_c is None:
+        return "n/d"
+    unit = normalize_temp_unit(prefs.get("temp_unit") if prefs else None)
+    val = temp_to_unit(float(value_c), unit)
+    suffix = "F°" if unit == "F" else "C°"
+    return f"{val:.{decimals}f} {suffix}"
+
+def format_temp_delta(value_c: Optional[float], prefs: Optional[Dict[str, Any]] = None, decimals: int = 1) -> str:
+    if value_c is None:
+        return "n/d"
+    unit = normalize_temp_unit(prefs.get("temp_unit") if prefs else None)
+    val = temp_delta_to_unit(float(value_c), unit)
+    suffix = "F°" if unit == "F" else "C°"
+    return f"{val:.{decimals}f} {suffix}"
+
+def format_wind(value_kph: Optional[float], prefs: Optional[Dict[str, Any]] = None, decimals: int = 0) -> str:
+    if value_kph is None:
+        return "n/d"
+    unit = normalize_wind_unit(prefs.get("wind_unit") if prefs else None)
+    val = wind_to_unit(float(value_kph), unit)
+    suffix = "mph" if unit == "mph" else "km/h"
+    return f"{val:.{decimals}f} {suffix}"
+
+def format_alert_window(prefs: Dict[str, Any]) -> str:
+    start = prefs.get("alert_start_hour", DEFAULT_ALERT_START_HOUR)
+    end = prefs.get("alert_end_hour", DEFAULT_ALERT_END_HOUR)
+    if start == -1 and end == -1:
+        return "OFF"
+    if start == end:
+        return "24h"
+    return f"{int(start):02d}-{int(end):02d}"
+
+def parse_alert_window(value: str) -> Optional[Tuple[int, int]]:
+    v = value.strip().lower()
+    if v in {"off", "no", "false", "0"}:
+        return -1, -1
+    if v in {"all", "24", "24h"}:
+        return 0, 0
+    if "-" not in v:
+        return None
+    left, right = v.split("-", 1)
+    try:
+        start = int(left.strip())
+        end = int(right.strip())
+    except Exception:
+        return None
+    if not (0 <= start <= 23 and 0 <= end <= 23):
+        return None
+    return start, end
+
+def within_alert_window(now_local: datetime, prefs: Dict[str, Any]) -> bool:
+    start = int(prefs.get("alert_start_hour", DEFAULT_ALERT_START_HOUR))
+    end = int(prefs.get("alert_end_hour", DEFAULT_ALERT_END_HOUR))
+    if start == -1 and end == -1:
+        return False
+    if start == end:
+        return True
+    hour = now_local.hour
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
 def format_date_italian(dt: Optional[datetime] = None) -> str:
     if dt is None:
         dt = datetime.now()
@@ -215,6 +389,49 @@ def format_uptime(td: timedelta) -> str:
         parts.append(f"{hours}h")
     parts.append(f"{mins}m")
     return " ".join(parts)
+
+def forecast_ttl_minutes(local_dt: Optional[datetime]) -> int:
+    if not local_dt:
+        return CACHE_TTL_FORECAST_MIN
+    hour = local_dt.hour
+    if 0 <= hour < 6:
+        return int(CACHE_TTL_FORECAST_MIN * NIGHT_FORECAST_TTL_MULT)
+    return CACHE_TTL_FORECAST_MIN
+
+def cache_age_min_from_payload(payload: Optional[Dict[str, Any]], created_at: Optional[datetime] = None) -> Optional[int]:
+    if not payload:
+        return None
+    saved_at = payload.get("saved_at")
+    if saved_at:
+        try:
+            dt = from_iso(saved_at)
+        except Exception:
+            dt = created_at
+    else:
+        dt = created_at
+    if not dt:
+        return None
+    return int((now_utc() - dt).total_seconds() // 60)
+
+def build_provider_note(
+    enabled: List[str],
+    available: List[str],
+    cache_stale: bool = False,
+    cache_age_min: Optional[int] = None,
+) -> Optional[str]:
+    missing = [p for p in enabled if p not in available]
+    parts = []
+    if missing:
+        parts.append(f"Provider non disponibili: {', '.join(missing)}")
+    if cache_stale:
+        age_txt = f" ({cache_age_min}m)" if cache_age_min is not None else ""
+        parts.append(f"Dati cache non aggiornati{age_txt}")
+    return ". ".join(parts) if parts else None
+
+def log_event(event: str, **fields: Any) -> None:
+    payload = {"event": event, "ts": iso(now_utc())}
+    payload.update({k: v for k, v in fields.items() if v is not None})
+    logger.info(json.dumps(payload, separators=(",", ":")))
 
 def season_from_date(d: date) -> str:
     m = d.month
@@ -472,7 +689,11 @@ class Storage:
               wind_threshold REAL,
               feels_diff REAL,
               alert_rain_60 INTEGER,
-              alert_tomorrow_rain INTEGER
+              alert_tomorrow_rain INTEGER,
+              temp_unit TEXT,
+              wind_unit TEXT,
+              alert_start_hour INTEGER,
+              alert_end_hour INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS user_cities (
@@ -504,6 +725,14 @@ class Storage:
               url TEXT,
               status INTEGER,
               detail TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_backoff (
+              provider TEXT PRIMARY KEY,
+              fail_count INTEGER NOT NULL,
+              backoff_until TEXT,
+              last_error TEXT,
+              updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS alerts_log (
@@ -606,6 +835,60 @@ class Storage:
             conn.execute("ALTER TABLE user_prefs ADD COLUMN alert_rain_60 INTEGER")
         if "alert_tomorrow_rain" not in cols:
             conn.execute("ALTER TABLE user_prefs ADD COLUMN alert_tomorrow_rain INTEGER")
+        if "temp_unit" not in cols:
+            conn.execute("ALTER TABLE user_prefs ADD COLUMN temp_unit TEXT")
+        if "wind_unit" not in cols:
+            conn.execute("ALTER TABLE user_prefs ADD COLUMN wind_unit TEXT")
+        if "alert_start_hour" not in cols:
+            conn.execute("ALTER TABLE user_prefs ADD COLUMN alert_start_hour INTEGER")
+        if "alert_end_hour" not in cols:
+            conn.execute("ALTER TABLE user_prefs ADD COLUMN alert_end_hour INTEGER")
+
+    # provider backoff
+    def get_provider_backoff_until(self, provider: str) -> Optional[datetime]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT backoff_until FROM provider_backoff WHERE provider=?",
+                (provider,)
+            ).fetchone()
+            if not row or not row["backoff_until"]:
+                return None
+            return from_iso(row["backoff_until"])
+
+    def record_provider_failure(self, provider: str, error: str):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT fail_count FROM provider_backoff WHERE provider=?",
+                (provider,)
+            ).fetchone()
+            fail_count = int(row["fail_count"]) + 1 if row else 1
+            backoff_until = None
+            if fail_count >= 3:
+                exp = min(15 * (2 ** (fail_count - 3)), 120)
+                backoff_until = now_utc() + timedelta(minutes=int(exp))
+            conn.execute(
+                "INSERT INTO provider_backoff(provider, fail_count, backoff_until, last_error, updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(provider) DO UPDATE SET "
+                "fail_count=excluded.fail_count, backoff_until=excluded.backoff_until, last_error=excluded.last_error, updated_at=excluded.updated_at",
+                (provider, fail_count, iso(backoff_until) if backoff_until else None, error[:120], iso(now_utc()))
+            )
+            conn.commit()
+
+    def record_provider_success(self, provider: str):
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO provider_backoff(provider, fail_count, backoff_until, last_error, updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(provider) DO UPDATE SET "
+                "fail_count=0, backoff_until=NULL, last_error=NULL, updated_at=excluded.updated_at",
+                (provider, 0, None, None, iso(now_utc()))
+            )
+            conn.commit()
+
+    def get_provider_backoff_status(self) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT provider, fail_count, backoff_until, last_error, updated_at FROM provider_backoff ORDER BY provider"
+            ).fetchall()
 
     def _migrate_user_cities(self, conn: sqlite3.Connection):
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(user_cities)").fetchall()}
@@ -722,6 +1005,10 @@ class Storage:
             "feels_diff": float(FEELS_LIKE_DIFF_C),
             "alert_rain_60": 0,
             "alert_tomorrow_rain": 1,
+            "temp_unit": DEFAULT_TEMP_UNIT,
+            "wind_unit": DEFAULT_WIND_UNIT,
+            "alert_start_hour": DEFAULT_ALERT_START_HOUR,
+            "alert_end_hour": DEFAULT_ALERT_END_HOUR,
         }
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM user_prefs WHERE user_id=?", (str(user_id),)).fetchone()
@@ -736,6 +1023,14 @@ class Storage:
                     prefs["alert_rain_60"] = int(row["alert_rain_60"])
                 if row["alert_tomorrow_rain"] is not None:
                     prefs["alert_tomorrow_rain"] = int(row["alert_tomorrow_rain"])
+                if row["temp_unit"] is not None:
+                    prefs["temp_unit"] = normalize_temp_unit(row["temp_unit"])
+                if row["wind_unit"] is not None:
+                    prefs["wind_unit"] = normalize_wind_unit(row["wind_unit"])
+                if row["alert_start_hour"] is not None:
+                    prefs["alert_start_hour"] = int(row["alert_start_hour"])
+                if row["alert_end_hour"] is not None:
+                    prefs["alert_end_hour"] = int(row["alert_end_hour"])
         return prefs
 
     def set_user_prefs(
@@ -746,31 +1041,60 @@ class Storage:
         feels_diff: Optional[float],
         alert_rain_60: Optional[int] = None,
         alert_tomorrow_rain: Optional[int] = None,
+        temp_unit: Optional[str] = None,
+        wind_unit: Optional[str] = None,
+        alert_start_hour: Optional[int] = None,
+        alert_end_hour: Optional[int] = None,
     ):
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO user_prefs(user_id, pop_threshold, wind_threshold, feels_diff, alert_rain_60, alert_tomorrow_rain) VALUES(?,?,?,?,?,?) "
+                "INSERT INTO user_prefs(user_id, pop_threshold, wind_threshold, feels_diff, alert_rain_60, alert_tomorrow_rain, temp_unit, wind_unit, alert_start_hour, alert_end_hour) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(user_id) DO UPDATE SET "
                 "pop_threshold=COALESCE(excluded.pop_threshold, user_prefs.pop_threshold), "
                 "wind_threshold=COALESCE(excluded.wind_threshold, user_prefs.wind_threshold), "
                 "feels_diff=COALESCE(excluded.feels_diff, user_prefs.feels_diff), "
                 "alert_rain_60=COALESCE(excluded.alert_rain_60, user_prefs.alert_rain_60), "
-                "alert_tomorrow_rain=COALESCE(excluded.alert_tomorrow_rain, user_prefs.alert_tomorrow_rain)",
-                (str(user_id), pop_threshold, wind_threshold, feels_diff, alert_rain_60, alert_tomorrow_rain)
+                "alert_tomorrow_rain=COALESCE(excluded.alert_tomorrow_rain, user_prefs.alert_tomorrow_rain), "
+                "temp_unit=COALESCE(excluded.temp_unit, user_prefs.temp_unit), "
+                "wind_unit=COALESCE(excluded.wind_unit, user_prefs.wind_unit), "
+                "alert_start_hour=COALESCE(excluded.alert_start_hour, user_prefs.alert_start_hour), "
+                "alert_end_hour=COALESCE(excluded.alert_end_hour, user_prefs.alert_end_hour)",
+                (
+                    str(user_id),
+                    pop_threshold,
+                    wind_threshold,
+                    feels_diff,
+                    alert_rain_60,
+                    alert_tomorrow_rain,
+                    temp_unit,
+                    wind_unit,
+                    alert_start_hour,
+                    alert_end_hour,
+                )
             )
             conn.commit()
 
     # cache
-    def cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+    def cache_get_with_meta(self, key: str, allow_expired: bool = False) -> Tuple[Optional[Dict[str, Any]], Optional[datetime], Optional[datetime], bool]:
         with self._connect() as conn:
-            row = conn.execute("SELECT payload, expires_at FROM cache WHERE cache_key=?", (key,)).fetchone()
+            row = conn.execute("SELECT payload, created_at, expires_at FROM cache WHERE cache_key=?", (key,)).fetchone()
             if not row:
-                return None
-            if now_utc() >= from_iso(row["expires_at"]):
+                return None, None, None, False
+            created = from_iso(row["created_at"])
+            expires = from_iso(row["expires_at"])
+            expired = now_utc() >= expires
+            if expired and not allow_expired:
                 conn.execute("DELETE FROM cache WHERE cache_key=?", (key,))
                 conn.commit()
-                return None
-            return json.loads(row["payload"])
+                return None, created, expires, True
+            return json.loads(row["payload"]), created, expires, expired
+
+    def cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+        payload, _, _, expired = self.cache_get_with_meta(key, allow_expired=False)
+        if expired:
+            return None
+        return payload
 
     def cache_set(self, key: str, payload: Dict[str, Any], ttl: timedelta):
         created = now_utc()
@@ -1231,30 +1555,78 @@ class HttpClient:
             timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SEC)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
-    async def get_json(self, url: str, params: Dict[str, Any]) -> Tuple[int, Optional[Any]]:
+    async def get_json(self, url: str, params: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Tuple[int, Optional[Any]]:
         await self.ensure()
+        ctx = context or {}
+        provider = ctx.get("provider")
+        if self.storage and provider:
+            backoff_until = self.storage.get_provider_backoff_until(provider)
+            if backoff_until and now_utc() < backoff_until:
+                log_event("http_backoff", provider=provider, url=url, until=iso(backoff_until))
+                return 0, None
         for attempt in range(2):
             try:
+                start = time.monotonic()
                 async with self.session.get(url, params=params) as resp:
+                    elapsed_ms = int((time.monotonic() - start) * 1000)
                     if resp.status != 200:
                         if resp.status in {429, 500, 502, 503, 504} and attempt == 0:
+                            rate_rem = resp.headers.get("X-RateLimit-Remaining") or resp.headers.get("X-Rate-Limit-Remaining")
+                            rate_lim = resp.headers.get("X-RateLimit-Limit") or resp.headers.get("X-Rate-Limit-Limit")
+                            log_event(
+                                "http_retry",
+                                provider=ctx.get("provider"),
+                                url=url,
+                                status=resp.status,
+                                ms=elapsed_ms,
+                                attempt=attempt + 1,
+                                rate_remaining=rate_rem,
+                                rate_limit=rate_lim,
+                            )
                             await asyncio.sleep(0.6)
                             continue
+                        rate_rem = resp.headers.get("X-RateLimit-Remaining") or resp.headers.get("X-Rate-Limit-Remaining")
+                        rate_lim = resp.headers.get("X-RateLimit-Limit") or resp.headers.get("X-Rate-Limit-Limit")
+                        log_event(
+                            "http_error",
+                            provider=ctx.get("provider"),
+                            url=url,
+                            status=resp.status,
+                            ms=elapsed_ms,
+                            attempt=attempt + 1,
+                            rate_remaining=rate_rem,
+                            rate_limit=rate_lim,
+                        )
                         if self.storage:
                             self.storage.log_error(url, resp.status, f"HTTP {resp.status}")
+                            if provider:
+                                self.storage.record_provider_failure(provider, f"HTTP {resp.status}")
                         return resp.status, None
+                    if self.storage and provider:
+                        self.storage.record_provider_success(provider)
                     return resp.status, await resp.json()
             except asyncio.TimeoutError:
+                log_event("http_timeout", provider=ctx.get("provider"), url=url, attempt=attempt + 1)
                 if attempt == 0:
                     await asyncio.sleep(0.6)
                     continue
                 if self.storage:
                     self.storage.log_error(url, 0, "timeout")
+                    if provider:
+                        self.storage.record_provider_failure(provider, "timeout")
                 return 0, None
             except Exception as exc:
                 logger.exception("HTTP error")
+                log_event(
+                    "http_exception",
+                    provider=ctx.get("provider"),
+                    url=url,
+                    error=type(exc).__name__,
+                )
                 if self.storage:
                     self.storage.log_error(url, 0, f"exception: {type(exc).__name__}")
+                    if provider:
+                        self.storage.record_provider_failure(provider, type(exc).__name__)
                 return 0, None
 
     async def close(self):
@@ -1302,7 +1674,7 @@ class OpenWeatherProvider:
             return None
         url = "https://api.openweathermap.org/geo/1.0/direct"
         params = {"q": city, "limit": 1, "appid": self.api_key}
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "OpenWeather", "endpoint": "geocode"})
         if not data:
             return None
         try:
@@ -1320,7 +1692,7 @@ class OpenWeatherProvider:
             return ProviderResult(False, "OpenWeather")
         url = "https://api.openweathermap.org/data/2.5/weather"
         params = {"lat": lat, "lon": lon, "appid": self.api_key, "units": "metric", "lang": "it"}
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "OpenWeather", "endpoint": "current"})
         if not data:
             return ProviderResult(False, "OpenWeather")
         try:
@@ -1344,7 +1716,7 @@ class OpenWeatherProvider:
             return None
         url = "https://api.openweathermap.org/data/2.5/forecast"
         params = {"lat": lat, "lon": lon, "appid": self.api_key, "units": "metric", "lang": "it", "cnt": 40}
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "OpenWeather", "endpoint": "forecast"})
         return data
 
 
@@ -1358,7 +1730,7 @@ class WeatherAPIProvider:
             return ProviderResult(False, "WeatherAPI")
         url = "https://api.weatherapi.com/v1/current.json"
         params = {"key": self.api_key, "q": f"{lat},{lon}", "lang": "it"}
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "WeatherAPI", "endpoint": "current"})
         if not data:
             return ProviderResult(False, "WeatherAPI")
         try:
@@ -1386,7 +1758,7 @@ class WeatherAPIProvider:
             return None
         url = "https://api.weatherapi.com/v1/forecast.json"
         params = {"key": self.api_key, "q": f"{lat},{lon}", "days": days, "aqi": "no", "alerts": "no", "lang": "it"}
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "WeatherAPI", "endpoint": "forecast"})
         return data
 
     async def history(self, lat: float, lon: float, date_str: str) -> Optional[Dict[str, Any]]:
@@ -1394,7 +1766,7 @@ class WeatherAPIProvider:
             return None
         url = "https://api.weatherapi.com/v1/history.json"
         params = {"key": self.api_key, "q": f"{lat},{lon}", "dt": date_str, "lang": "it"}
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "WeatherAPI", "endpoint": "history"})
         return data
 
     async def timezone(self, lat: float, lon: float) -> Optional[Dict[str, Any]]:
@@ -1402,7 +1774,7 @@ class WeatherAPIProvider:
             return None
         url = "https://api.weatherapi.com/v1/timezone.json"
         params = {"key": self.api_key, "q": f"{lat},{lon}"}
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "WeatherAPI", "endpoint": "timezone"})
         return data
 
     async def geocode(self, city: str) -> Optional[Dict[str, Any]]:
@@ -1410,7 +1782,7 @@ class WeatherAPIProvider:
             return None
         url = "https://api.weatherapi.com/v1/search.json"
         params = {"key": self.api_key, "q": city}
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "WeatherAPI", "endpoint": "geocode"})
         if not data:
             return None
         try:
@@ -1443,7 +1815,7 @@ class MeteoblueProvider:
             "temperature": "C",
             "windspeed": "kmh",
         }
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "Meteoblue", "endpoint": "current"})
         if not data:
             return ProviderResult(False, "Meteoblue")
         try:
@@ -1485,7 +1857,7 @@ class MeteoblueProvider:
             "windspeed": "kmh",
             "forecast_days": 2,
         }
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "Meteoblue", "endpoint": "forecast"})
         return data
 
     async def history(self, lat: float, lon: float, history_days: int = 1) -> Optional[Dict[str, Any]]:
@@ -1502,7 +1874,7 @@ class MeteoblueProvider:
             "history_days": int(history_days),
             "forecast_days": 0,
         }
-        status, data = await self.http.get_json(url, params)
+        status, data = await self.http.get_json(url, params, context={"provider": "Meteoblue", "endpoint": "history"})
         return data
 
 # ===================== WEATHER SERVICE (fusion + rain + accuracy) =====================
@@ -2301,10 +2673,17 @@ def format_meteo_message(
     reliability_percent: Optional[int] = None,
     fallback_note: Optional[str] = None,
     details: Optional[str] = None,
+    prefs: Optional[Dict[str, Any]] = None,
+    cache_stale: bool = False,
 ) -> str:
     city_md = md_escape(city)
     country_md = md_escape(country)
-    cache_label = "Live" if cache_age_min is None else f"Cache {cache_age_min}m"
+    if cache_age_min is None:
+        cache_label = "Live"
+    else:
+        cache_label = f"Cache {cache_age_min}m"
+        if cache_stale:
+            cache_label += " (stale)"
     icon = get_weather_icon(fused.get("icon", "01d"))
     if local_dt is None:
         local_dt = datetime.now()
@@ -2324,7 +2703,7 @@ def format_meteo_message(
         f"{icon} METEO {city_md}, {country_md}",
         f"{date_label} {time_label}",
         "",
-        f"\U0001F321 Ora: {fused['temp']:.1f} C\u00b0 (Percepita {fused['feels_like']:.1f} C\u00b0)",
+        f"\U0001F321 Ora: {format_temp(fused.get('temp'), prefs)} (Percepita {format_temp(fused.get('feels_like'), prefs)})",
         f"{icon} Condizioni: {desc_md}",
     ]
     if rain_msg:
@@ -2402,8 +2781,8 @@ def confidence_from_accuracy(acc: Dict[str, Dict[str, Any]]) -> Optional[str]:
     return "bassa"
 
 
-def format_details_line(fused: Dict[str, Any], acc: Dict[str, Dict[str, Any]]) -> str:
-    wind = f"{fused.get('wind_kph'):.0f} km/h" if fused.get("wind_kph") is not None else "n/d"
+def format_details_line(fused: Dict[str, Any], acc: Dict[str, Dict[str, Any]], prefs: Optional[Dict[str, Any]] = None) -> str:
+    wind = format_wind(fused.get("wind_kph"), prefs)
     humidity = f"{fused.get('humidity'):.0f}%" if fused.get("humidity") is not None else "n/d"
     pressure = f"{fused.get('pressure'):.0f} hPa" if fused.get("pressure") is not None else "n/d"
     line1 = f"Dettagli: vento {wind}, umidita {humidity}, pressione {pressure}"
@@ -2414,7 +2793,7 @@ def format_details_line(fused: Dict[str, Any], acc: Dict[str, Dict[str, Any]]) -
         temp = info.get("temp")
         weight = info.get("weight")
         acc_val = acc.get(name, {}).get("accuracy") if acc else None
-        seg = f"{short} {temp:.1f}C\u00b0" if temp is not None else f"{short} n/d"
+        seg = f"{short} {format_temp(temp, prefs)}" if temp is not None else f"{short} n/d"
         if weight is not None:
             seg += f" peso {weight:.2f}"
         if acc_val is not None:
@@ -2428,6 +2807,7 @@ def format_forecast_message(
     country: str,
     days: int,
     sources_label: str,
+    fallback_note: Optional[str] = None,
     target_date: Optional[date] = None,
     points_ow: Optional[List[Dict[str, Any]]] = None,
     points_wa: Optional[List[Dict[str, Any]]] = None,
@@ -2438,6 +2818,7 @@ def format_forecast_message(
     season: Optional[str] = None,
     zone: Optional[str] = None,
     kind_group: Optional[str] = None,
+    prefs: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     if not points:
         return None
@@ -2473,7 +2854,7 @@ def format_forecast_message(
     lines.append(f"{format_date_italian(datetime.combine(target_date, datetime.min.time()))}")
     lines.append("")
     if min_t is not None and max_t is not None:
-        lines.append(f"Min/Max: {min_t:.1f}C\u00b0 / {max_t:.1f}C\u00b0")
+        lines.append(f"Min/Max: {format_temp(min_t, prefs)} / {format_temp(max_t, prefs)}")
     lines.append("Orari (1h):" if days == 1 else "Orari (3h):")
     for p in chosen:
         hour = int(p["ora"].split(":")[0])
@@ -2490,7 +2871,7 @@ def format_forecast_message(
             conf = hourly_confidence_percent(ow_p, wa_p, mb_p, acc)
         icon = get_weather_icon(str(p.get("icon", "01d")))
         rain = f" (POP {p['pop']:.0f}%)" if p["pop"] > 20 else ""
-        lines.append(f"- {p['ora']}: {p['temp']:.1f}C\u00b0{rain} {icon} {conf}%")
+        lines.append(f"- {p['ora']}: {format_temp(p.get('temp'), prefs)}{rain} {icon} {conf}%")
     lines.append("Pioggia:")
     if rain_periods:
         for r in rain_periods[:3]:
@@ -2500,6 +2881,8 @@ def format_forecast_message(
     else:
         lines.append("- Nessuna pioggia significativa")
     lines.append(f"Fonti: {sources_label}")
+    if fallback_note:
+        lines.append(f"Nota: {fallback_note}")
     if chosen:
         confs = []
         for p in chosen:
@@ -2540,6 +2923,7 @@ def format_today_summary(
     now_local: Optional[datetime] = None,
     reliability_percent: Optional[int] = None,
     rain_threshold: Optional[float] = None,
+    prefs: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     if not points:
         return None
@@ -2550,7 +2934,7 @@ def format_today_summary(
     lines.append(f"{format_date_italian(datetime.combine(target_date, datetime.min.time()))}")
     lines.append("")
     if min_t is not None and max_t is not None:
-        lines.append(f"\U0001F321 Min/Max: {min_t:.1f}C\u00b0 / {max_t:.1f}C\u00b0")
+        lines.append(f"\U0001F321 Min/Max: {format_temp(min_t, prefs)} / {format_temp(max_t, prefs)}")
 
     # Temperature trend (morning vs afternoon)
     early = [p["temp"] for p in points if 6 <= p["local_time"].hour <= 11]
@@ -2869,11 +3253,12 @@ async def comandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /delcitta - rimuove citta\n"
         "- /controlla - verifica previsioni vicine all'orario\n"
         "- /pref - mostra preferenze\n"
-        "- /setpref pop=60 vento=40 diff=3 alert60=on alertdomani=on\n"
+        "- /setpref pop=60 vento=40 diff=3 unit=c windunit=kmh alert60=on alertdomani=on notifiche=07-22\n"
         "- /stat - errori recenti\n"
         "- /testoffline [giorni] - test su storico\n"
         "- /info - stato sistema\n"
         "- /versione - info versione bot\n"
+        "- /admin <token> - stato admin (se autorizzato)\n"
     )
     await update.effective_message.reply_text(msg)
 
@@ -2979,6 +3364,7 @@ async def meteo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(MSG_CITY_NOT_FOUND)
         return
 
+    prefs = state.storage.get_user_prefs(update.effective_user.id)
     lat, lon = coords["lat"], coords["lon"]
     ck_cur = key_current(lat, lon)
     ck_fc = key_forecast(lat, lon, 0)
@@ -3009,7 +3395,9 @@ async def meteo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if forecast_ow or forecast_wa or forecast_mb:
             payload_fc = {"forecast_ow": forecast_ow, "forecast_wa": forecast_wa, "forecast_mb": forecast_mb, "saved_at": iso(now_utc())}
-            state.storage.cache_set(ck_fc, payload_fc, ttl=timedelta(minutes=CACHE_TTL_FORECAST_MIN))
+            tz_offset_fc = get_tz_offset_sec(forecast_ow, forecast_wa, forecast_mb, coords=coords)
+            ttl_fc = forecast_ttl_minutes(local_now(tz_offset_fc))
+            state.storage.cache_set(ck_fc, payload_fc, ttl=timedelta(minutes=ttl_fc))
             state.ram_cache.set(ck_fc, payload_fc, ttl_seconds=30)
 
     if not force:
@@ -3066,7 +3454,7 @@ async def meteo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 correction_used = any(abs(bias_ctx.get(p, 0.0)) >= 0.3 for p in available)
 
             acc = state.storage.get_provider_accuracy()
-            details_line = format_details_line(fused, acc) if details else None
+            details_line = format_details_line(fused, acc, prefs) if details else None
             enabled = [p for p, k in [("OpenWeather", OPENWEATHER_API_KEY), ("WeatherAPI", WEATHERAPI_KEY), ("Meteoblue", METEOBLUE_API_KEY)] if k]
             available = fused.get("sources", [])
             missing = [p for p in enabled if p not in available]
@@ -3085,9 +3473,9 @@ async def meteo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state.storage, ow_p, wa_p, mb_p, band, cond,
                 kind_group="now", season=season, zone=zone
             )
-            fallback_note = None
+            fallback_note = build_provider_note(enabled, available)
             msg = format_meteo_message(
-                fused, coords["name"], coords["country"], min_t, max_t, rain_msg, sources_label, age_min, local_dt, reliability, fallback_note, details_line
+                fused, coords["name"], coords["country"], min_t, max_t, rain_msg, sources_label, age_min, local_dt, reliability, fallback_note, details_line, prefs=prefs
             )
             await update.effective_message.reply_text(msg, parse_mode="Markdown")
             return
@@ -3138,6 +3526,42 @@ async def meteo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fused = state.weather.fuse(ow_cur, wa_cur, mb_cur, bias=bias_ctx, weights_override=weights_ctx)
     if not fused:
+        stale_payload, created_at, _, expired = state.storage.cache_get_with_meta(ck_cur, allow_expired=True)
+        if stale_payload and stale_payload.get("fused"):
+            age_min = cache_age_min_from_payload(stale_payload, created_at)
+            fused = stale_payload.get("fused")
+            min_t = stale_payload.get("min_t")
+            max_t = stale_payload.get("max_t")
+            rain_msg = stale_payload.get("rain_msg") or ""
+            rain_current = stale_payload.get("rain_current")
+            correction_used = stale_payload.get("correction_used")
+            if rain_current is None:
+                rain_current = is_rain_description(str(fused.get("description", "")))
+            acc = state.storage.get_provider_accuracy()
+            details_line = format_details_line(fused, acc, prefs) if details else None
+            enabled = [p for p, k in [("OpenWeather", OPENWEATHER_API_KEY), ("WeatherAPI", WEATHERAPI_KEY), ("Meteoblue", METEOBLUE_API_KEY)] if k]
+            available = fused.get("sources", [])
+            missing = [p for p in enabled if p not in available]
+            sources_label = format_sources_label(available, correction_used, missing)
+            fallback_note = build_provider_note(enabled, available, cache_stale=expired, cache_age_min=age_min)
+            msg = format_meteo_message(
+                fused,
+                coords["name"],
+                coords["country"],
+                min_t,
+                max_t,
+                rain_msg,
+                sources_label,
+                age_min,
+                local_dt,
+                None,
+                fallback_note,
+                details_line,
+                prefs=prefs,
+                cache_stale=expired,
+            )
+            await update.effective_message.reply_text(msg, parse_mode="Markdown")
+            return
         await update.effective_message.reply_text(MSG_SERVICE_UNAVAILABLE)
         return
 
@@ -3171,7 +3595,7 @@ async def meteo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rain_msg = summarize_rain_forecast(periods, max_pop_all, local_dt, rain_current)
 
     acc = state.storage.get_provider_accuracy()
-    details_line = format_details_line(fused, acc) if details else None
+    details_line = format_details_line(fused, acc, prefs) if details else None
     enabled = [p for p, k in [("OpenWeather", OPENWEATHER_API_KEY), ("WeatherAPI", WEATHERAPI_KEY), ("Meteoblue", METEOBLUE_API_KEY)] if k]
     available = fused.get("sources", [])
     missing = [p for p in enabled if p not in available]
@@ -3185,7 +3609,7 @@ async def meteo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.storage, ow_p, wa_p, mb_p, band, cond_group,
         kind_group="now", season=season, zone=zone
     )
-    fallback_note = None
+    fallback_note = build_provider_note(enabled, available)
 
     payload = {
         "fused": fused,
@@ -3204,7 +3628,7 @@ async def meteo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.ram_cache.set(ck_cur, payload, ttl_seconds=30)
 
     msg = format_meteo_message(
-        fused, coords["name"], coords["country"], min_t, max_t, rain_msg, sources_label, None, local_dt, reliability, fallback_note, details_line
+        fused, coords["name"], coords["country"], min_t, max_t, rain_msg, sources_label, None, local_dt, reliability, fallback_note, details_line, prefs=prefs
     )
     if force:
         msg += "\nAggiornamento forzato"
@@ -3249,18 +3673,37 @@ async def _load_forecast_points(
     int,
     str,
     bool,
+    bool,
+    Optional[int],
 ]:
     lat, lon = coords["lat"], coords["lon"]
     ck = key_forecast(lat, lon, 0)
 
     cached_used = False
-    cached = state.ram_cache.get(ck) or state.storage.cache_get(ck)
+    cache_stale = False
+    cache_age_min = None
+    stale_payload = None
+    stale_created_at = None
+
+    cached = state.ram_cache.get(ck)
     if cached:
         forecast_ow = cached.get("forecast_ow")
         forecast_wa = cached.get("forecast_wa")
         forecast_mb = cached.get("forecast_mb")
         cached_used = True
     else:
+        cached_meta, created_at, _, expired = state.storage.cache_get_with_meta(ck, allow_expired=True)
+        if cached_meta and not expired:
+            forecast_ow = cached_meta.get("forecast_ow")
+            forecast_wa = cached_meta.get("forecast_wa")
+            forecast_mb = cached_meta.get("forecast_mb")
+            cached_used = True
+            state.ram_cache.set(ck, cached_meta, ttl_seconds=30)
+        elif cached_meta and expired:
+            stale_payload = cached_meta
+            stale_created_at = created_at
+
+    if not cached_used:
         forecast_ow, forecast_wa, forecast_mb = await asyncio.gather(
             state.ow.forecast(lat, lon),
             state.wa.forecast(lat, lon, days=2),
@@ -3268,11 +3711,20 @@ async def _load_forecast_points(
         )
         if forecast_ow or forecast_wa or forecast_mb:
             payload = {"forecast_ow": forecast_ow, "forecast_wa": forecast_wa, "forecast_mb": forecast_mb, "saved_at": iso(now_utc())}
-            state.storage.cache_set(ck, payload, ttl=timedelta(minutes=CACHE_TTL_FORECAST_MIN))
+            tz_offset_fc = get_tz_offset_sec(forecast_ow, forecast_wa, forecast_mb, coords=coords)
+            ttl_fc = forecast_ttl_minutes(local_now(tz_offset_fc))
+            state.storage.cache_set(ck, payload, ttl=timedelta(minutes=ttl_fc))
             state.ram_cache.set(ck, payload, ttl_seconds=30)
+        elif stale_payload:
+            forecast_ow = stale_payload.get("forecast_ow")
+            forecast_wa = stale_payload.get("forecast_wa")
+            forecast_mb = stale_payload.get("forecast_mb")
+            cached_used = True
+            cache_stale = True
+            cache_age_min = cache_age_min_from_payload(stale_payload, stale_created_at)
 
     if not forecast_ow and not forecast_wa and not forecast_mb:
-        return None, None, None, [], [], [], [], datetime.now().date(), 0, "", cached_used
+        return None, None, None, [], [], [], [], datetime.now().date(), 0, "", cached_used, cache_stale, cache_age_min
 
     tz_offset = get_tz_offset_sec(forecast_ow, forecast_wa, forecast_mb, coords=coords)
     target_date = (local_now(tz_offset).date() + timedelta(days=days))
@@ -3313,7 +3765,7 @@ async def _load_forecast_points(
     missing = [p for p in enabled if p not in sources]
     sources_label = format_sources_label(sources, correction_used, missing)
 
-    return forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used
+    return forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used, cache_stale, cache_age_min
 
 
 async def _forecast_common(update: Update, context: ContextTypes.DEFAULT_TYPE, days: int):
@@ -3332,7 +3784,7 @@ async def _forecast_common(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         await update.effective_message.reply_text(MSG_CITY_NOT_FOUND)
         return
 
-    forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used = await _load_forecast_points(
+    forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used, cache_stale, cache_age_min = await _load_forecast_points(
         state, coords, days
     )
     if not forecast_ow and not forecast_wa and not forecast_mb:
@@ -3342,12 +3794,23 @@ async def _forecast_common(update: Update, context: ContextTypes.DEFAULT_TYPE, d
     ths = get_dynamic_thresholds(state.storage)
     season = season_from_date(target_date)
     zone = zone_bucket(coords["lat"], coords["lon"])
+    prefs = state.storage.get_user_prefs(update.effective_user.id)
+    enabled = [p for p, k in [("OpenWeather", OPENWEATHER_API_KEY), ("WeatherAPI", WEATHERAPI_KEY), ("Meteoblue", METEOBLUE_API_KEY)] if k]
+    sources = []
+    if points_ow:
+        sources.append("OpenWeather")
+    if points_wa:
+        sources.append("WeatherAPI")
+    if points_mb:
+        sources.append("Meteoblue")
+    fallback_note = build_provider_note(enabled, sources, cache_stale=cache_stale, cache_age_min=cache_age_min)
     msg = format_forecast_message(
         fused_points,
         coords["name"],
         coords["country"],
         days,
         sources_label,
+        fallback_note=fallback_note,
         target_date=target_date,
         points_ow=points_ow,
         points_wa=points_wa,
@@ -3358,12 +3821,14 @@ async def _forecast_common(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         season=season,
         zone=zone,
         kind_group="forecast",
+        prefs=prefs,
     )
     if not msg:
         await update.effective_message.reply_text("Nessuna previsione disponibile")
         return
     if cached_used:
-        await update.effective_message.reply_text(msg + "\nDato: Cache", parse_mode="Markdown")
+        cache_line = "\nDato: Cache (stale)" if cache_stale else "\nDato: Cache"
+        await update.effective_message.reply_text(msg + cache_line, parse_mode="Markdown")
     else:
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
@@ -3401,7 +3866,7 @@ async def oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(MSG_CITY_NOT_FOUND)
         return
 
-    forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used = await _load_forecast_points(
+    forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used, cache_stale, _ = await _load_forecast_points(
         state, coords, 0
     )
     if not forecast_ow and not forecast_wa and not forecast_mb:
@@ -3417,6 +3882,7 @@ async def oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fused_points, points_ow, points_wa, points_mb, acc, target_date, from_hour=now_local.hour,
         storage=state.storage, kind_group="forecast", season=season, zone=zone
     )
+    prefs = state.storage.get_user_prefs(update.effective_user.id)
     msg = format_today_summary(
         fused_points,
         coords["name"],
@@ -3425,6 +3891,7 @@ async def oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now_local=now_local,
         reliability_percent=reliability,
         rain_threshold=ths.get("pop"),
+        prefs=prefs,
     )
     if not msg:
         await update.effective_message.reply_text("Nessuna previsione disponibile")
@@ -3467,7 +3934,7 @@ async def prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(MSG_CITY_NOT_FOUND)
         return
 
-    forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used = await _load_forecast_points(
+    forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used, cache_stale, cache_age_min = await _load_forecast_points(
         state, coords, 0
     )
     if not forecast_ow and not forecast_wa and not forecast_mb:
@@ -3490,6 +3957,7 @@ async def prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"Da {start_hour:02d}:00 a 23:00")
     lines.append("")
 
+    prefs = state.storage.get_user_prefs(update.effective_user.id)
     for h in range(start_hour, 24):
         p = by_hour.get(h)
         if not p:
@@ -3503,12 +3971,23 @@ async def prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kind_group="forecast", season=season, zone=zone
         )
         icon = get_weather_icon(str(p.get("icon", "01d")))
-        lines.append(f"{h:02d}:00 {p['temp']:.1f}C\u00b0 {conf}% {icon}")
+        lines.append(f"{h:02d}:00 {format_temp(p.get('temp'), prefs)} {conf}% {icon}")
 
     lines.append("")
     lines.append(f"Fonti: {sources_label}")
+    enabled = [p for p, k in [("OpenWeather", OPENWEATHER_API_KEY), ("WeatherAPI", WEATHERAPI_KEY), ("Meteoblue", METEOBLUE_API_KEY)] if k]
+    sources = []
+    if points_ow:
+        sources.append("OpenWeather")
+    if points_wa:
+        sources.append("WeatherAPI")
+    if points_mb:
+        sources.append("Meteoblue")
+    fallback_note = build_provider_note(enabled, sources, cache_stale=cache_stale, cache_age_min=cache_age_min)
+    if fallback_note:
+        lines.append(f"Nota: {fallback_note}")
     if cached_used:
-        lines.append("Dato: Cache")
+        lines.append("Dato: Cache (stale)" if cache_stale else "Dato: Cache")
 
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -3518,13 +3997,19 @@ async def domani(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state: AppState = context.application.bot_data["state"]
     prefs = state.storage.get_user_prefs(update.effective_user.id)
+    temp_unit = normalize_temp_unit(prefs.get("temp_unit"))
+    wind_unit = normalize_wind_unit(prefs.get("wind_unit"))
+    wind_unit_label = "mph" if wind_unit == "mph" else "km/h"
     msg = (
         "Preferenze utente:\n"
         f"- POP ombrello: {prefs['pop_threshold']:.0f}%\n"
-        f"- Vento forte: {prefs['wind_threshold']:.0f} km/h\n"
-        f"- Percepita diversa: {prefs['feels_diff']:.0f}C\u00b0\n"
+        f"- Vento forte: {format_wind(prefs['wind_threshold'], prefs)}\n"
+        f"- Percepita diversa: {format_temp_delta(prefs['feels_diff'], prefs)}\n"
         f"- Avviso pioggia 60 min: {'ON' if prefs.get('alert_rain_60') else 'OFF'}\n"
-        f"- Avviso pioggia domani: {'ON' if prefs.get('alert_tomorrow_rain', 1) else 'OFF'}"
+        f"- Avviso pioggia domani: {'ON' if prefs.get('alert_tomorrow_rain', 1) else 'OFF'}\n"
+        f"- Unita temperatura: {temp_unit}\n"
+        f"- Unita vento: {wind_unit_label}\n"
+        f"- Fascia notifiche: {format_alert_window(prefs)}"
     )
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
@@ -3532,12 +4017,14 @@ async def setpref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state: AppState = context.application.bot_data["state"]
     if not context.args:
         await update.effective_message.reply_text(
-            "Usa: /setpref pop=60 vento=40 diff=3 alert60=on alertdomani=on",
+            "Usa: /setpref pop=60 vento=40 diff=3 unit=c windunit=kmh alert60=on alertdomani=on notifiche=07-22",
             parse_mode="Markdown"
         )
         return
     pop = wind = diff = None
     alert60 = alertdomani = None
+    temp_unit = wind_unit = None
+    alert_window = None
     for arg in context.args:
         if "=" not in arg:
             continue
@@ -3554,11 +4041,44 @@ async def setpref(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wind = val
         elif k in {"diff", "percepita"}:
             diff = val
+        elif k in {"unit", "temp", "tempunit"}:
+            temp_unit = v
+        elif k in {"windunit", "unita_vento"}:
+            wind_unit = v
         elif k in {"alert60", "pioggia60"}:
             alert60 = 1 if v.lower() in {"on", "si", "true", "1"} else 0
         elif k in {"alertdomani", "domani"}:
             alertdomani = 1 if v.lower() in {"on", "si", "true", "1"} else 0
-    state.storage.set_user_prefs(update.effective_user.id, pop, wind, diff, alert_rain_60=alert60, alert_tomorrow_rain=alertdomani)
+        elif k in {"notifiche", "alertwindow", "finestra"}:
+            alert_window = v
+
+    prefs = state.storage.get_user_prefs(update.effective_user.id)
+    final_temp_unit = normalize_temp_unit(temp_unit or prefs.get("temp_unit"))
+    final_wind_unit = normalize_wind_unit(wind_unit or prefs.get("wind_unit"))
+
+    if diff is not None and final_temp_unit == "F":
+        diff = float(diff) / 1.8
+    if wind is not None and final_wind_unit == "mph":
+        wind = float(wind) * 1.60934
+
+    alert_start = alert_end = None
+    if alert_window:
+        parsed = parse_alert_window(alert_window)
+        if parsed:
+            alert_start, alert_end = parsed
+
+    state.storage.set_user_prefs(
+        update.effective_user.id,
+        pop,
+        wind,
+        diff,
+        alert_rain_60=alert60,
+        alert_tomorrow_rain=alertdomani,
+        temp_unit=final_temp_unit if temp_unit is not None else None,
+        wind_unit=final_wind_unit if wind_unit is not None else None,
+        alert_start_hour=alert_start,
+        alert_end_hour=alert_end,
+    )
     await update.effective_message.reply_text("Preferenze aggiornate.", parse_mode="Markdown")
 
 async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3577,6 +4097,76 @@ async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token = context.args[0] if context.args else None
+    uid = update.effective_user.id
+    if not ADMIN_SECRET and not ADMIN_IDS_SET:
+        await update.effective_message.reply_text("Admin non configurato. Imposta ADMIN_SECRET o ADMIN_USER_IDS.")
+        return
+    if not is_admin(uid, token):
+        await update.effective_message.reply_text("Accesso negato.")
+        return
+
+    state: AppState = context.application.bot_data["state"]
+    lines = []
+    lines.append("\U0001F6E1 STATUS ADMIN")
+    lines.append(f"{format_date_italian()} {format_time_italian()}")
+    lines.append("")
+    try:
+        with state.storage._connect() as conn:
+            cache_count = conn.execute("SELECT COUNT(*) AS n FROM cache").fetchone()["n"]
+            pred_total = conn.execute("SELECT COUNT(*) AS n FROM predictions").fetchone()["n"]
+            pred_ok = conn.execute("SELECT COUNT(*) AS n FROM predictions WHERE verified=1").fetchone()["n"]
+            err_total = conn.execute("SELECT COUNT(*) AS n FROM errors_log").fetchone()["n"]
+        db_size_kb = int(os.path.getsize(DB_FILE) / 1024) if os.path.exists(DB_FILE) else 0
+        lines.append("DB")
+        lines.append(f"- Cache: {cache_count}")
+        lines.append(f"- Predizioni: {pred_total} (verificate {pred_ok})")
+        lines.append(f"- Errori totali: {err_total}")
+        lines.append(f"- DB size: {db_size_kb} KB")
+    except Exception:
+        pass
+
+    rows = state.storage.get_recent_errors(5)
+    lines.append("")
+    lines.append("Errori recenti")
+    if not rows:
+        lines.append("- nessuno")
+    else:
+        for r in rows:
+            created = md_escape(r["created_at"])
+            status = md_escape(str(r["status"]))
+            detail = md_escape(r["detail"])
+            lines.append(f"- {created} | {status} | {detail}")
+
+    try:
+        backoff_rows = state.storage.get_provider_backoff_status()
+        lines.append("")
+        lines.append("Backoff provider")
+        now = now_utc()
+        if not backoff_rows:
+            lines.append("- nessun dato")
+        else:
+            for r in backoff_rows:
+                until = r["backoff_until"]
+                if not until:
+                    status = "OK"
+                else:
+                    until_dt = from_iso(until)
+                    if now >= until_dt:
+                        status = "OK"
+                    else:
+                        mins = int((until_dt - now).total_seconds() // 60)
+                        status = f"PAUSA {mins}m"
+                fail_count = int(r["fail_count"]) if r["fail_count"] is not None else 0
+                last_err = r["last_error"] or "-"
+                lines.append(f"- {r['provider']}: {status} (fail {fail_count}, last {last_err})")
+    except Exception:
+        pass
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def testoffline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state: AppState = context.application.bot_data["state"]
     days = OFFLINE_TEST_DAYS
@@ -3589,18 +4179,19 @@ async def testoffline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not stats or stats.get("count", 0) == 0:
         await update.effective_message.reply_text("Nessun dato storico verificato.", parse_mode="Markdown")
         return
+    prefs = state.storage.get_user_prefs(update.effective_user.id)
     lines = []
     lines.append("TEST OFFLINE")
     lines.append(f"Periodo: ultimi {stats['days']} giorni")
     lines.append(f"Campioni: {stats['count']}")
     if stats.get("fused_mae") is not None:
-        lines.append(f"Errore medio (fuso): {stats['fused_mae']:.1f}C\u00b0")
+        lines.append(f"Errore medio (fuso): {format_temp_delta(stats['fused_mae'], prefs)}")
     if stats.get("ow_mae") is not None:
-        lines.append(f"Errore medio OW: {stats['ow_mae']:.1f}C\u00b0")
+        lines.append(f"Errore medio OW: {format_temp_delta(stats['ow_mae'], prefs)}")
     if stats.get("wa_mae") is not None:
-        lines.append(f"Errore medio WA: {stats['wa_mae']:.1f}C\u00b0")
+        lines.append(f"Errore medio WA: {format_temp_delta(stats['wa_mae'], prefs)}")
     if stats.get("mb_mae") is not None:
-        lines.append(f"Errore medio MB: {stats['mb_mae']:.1f}C\u00b0")
+        lines.append(f"Errore medio MB: {format_temp_delta(stats['mb_mae'], prefs)}")
     if stats.get("rain_total", 0):
         lines.append(f"Pioggia corretta: {stats['rain_hits']}/{stats['rain_total']}")
     if stats.get("cond_total", 0):
@@ -3657,7 +4248,9 @@ async def _get_forecast_cached(state: AppState, lat: float, lon: float) -> Tuple
     )
     if forecast_ow or forecast_wa or forecast_mb:
         payload = {"forecast_ow": forecast_ow, "forecast_wa": forecast_wa, "forecast_mb": forecast_mb, "saved_at": iso(now_utc())}
-        state.storage.cache_set(ck, payload, ttl=timedelta(minutes=CACHE_TTL_FORECAST_MIN))
+        tz_offset_fc = get_tz_offset_sec(forecast_ow, forecast_wa, forecast_mb, coords=None)
+        ttl_fc = forecast_ttl_minutes(local_now(tz_offset_fc))
+        state.storage.cache_set(ck, payload, ttl=timedelta(minutes=ttl_fc))
         state.ram_cache.set(ck, payload, ttl_seconds=30)
     return forecast_ow, forecast_wa, forecast_mb
 
@@ -3717,6 +4310,8 @@ async def _check_alerts_for_user(state: AppState, user_id: int, context: Context
         return
     tz_offset = get_tz_offset_sec(forecast_ow, forecast_wa, forecast_mb, coords=coords)
     now_local = local_now(tz_offset)
+    if not within_alert_window(now_local, prefs):
+        return
     target_date = now_local.date()
     season = season_from_date(target_date)
     zone = zone_bucket(lat, lon)
@@ -3766,7 +4361,7 @@ async def _check_alerts_for_user(state: AppState, user_id: int, context: Context
     wind_kph = fused_cur.get("wind_kph") if fused_cur else None
     if wind_kph is not None and wind_kph >= ALERT_WIND_KPH:
         if _alert_ready(state.storage, user_id, "wind"):
-            text = f"Vento forte a {coords['name']}: {wind_kph:.0f} km/h"
+            text = f"Vento forte a {coords['name']}: {format_wind(wind_kph, prefs)}"
             await context.bot.send_message(chat_id=user_id, text=text)
             state.storage.set_last_alert(user_id, "wind", now_utc())
 
@@ -3774,12 +4369,12 @@ async def _check_alerts_for_user(state: AppState, user_id: int, context: Context
     min_t, max_t = extract_min_max(fused_points)
     if max_t is not None and max_t >= ALERT_TEMP_HOT:
         if _alert_ready(state.storage, user_id, "hot"):
-            text = f"Caldo estremo oggi a {coords['name']}: max {max_t:.0f}C\u00b0"
+            text = f"Caldo estremo oggi a {coords['name']}: max {format_temp(max_t, prefs, decimals=0)}"
             await context.bot.send_message(chat_id=user_id, text=text)
             state.storage.set_last_alert(user_id, "hot", now_utc())
     if min_t is not None and min_t <= ALERT_TEMP_COLD:
         if _alert_ready(state.storage, user_id, "cold"):
-            text = f"Freddo estremo oggi a {coords['name']}: min {min_t:.0f}C\u00b0"
+            text = f"Freddo estremo oggi a {coords['name']}: min {format_temp(min_t, prefs, decimals=0)}"
             await context.bot.send_message(chat_id=user_id, text=text)
             state.storage.set_last_alert(user_id, "cold", now_utc())
 
@@ -3800,6 +4395,7 @@ async def _build_controlla_report(
     city: str,
     coords: Dict[str, Any],
 ) -> Optional[str]:
+    prefs = state.storage.get_user_prefs(user_id)
     if not WEATHERAPI_KEY and not METEOBLUE_API_KEY:
         return "Storico non disponibile (manca WeatherAPI e Meteoblue)."
 
@@ -3962,7 +4558,7 @@ async def _build_controlla_report(
         status_icon = "\u2705" if err <= 1.5 else "\u26a0\ufe0f" if err <= 3 else "\u274c"
         details.append(
             f"{status_icon} {row['kind']} {target_dt.strftime('%H:%M')} "
-            f"{pred_fused:.1f}C\u00b0 -> {float(actual_temp):.1f}C\u00b0 (err {err:.1f}C\u00b0){rain_note}{cond_note}"
+            f"{format_temp(pred_fused, prefs)} -> {format_temp(float(actual_temp), prefs)} (err {format_temp_delta(err, prefs)}){rain_note}{cond_note}"
         )
 
     avg_err = sum(errors) / len(errors) if errors else 0.0
@@ -3983,8 +4579,8 @@ async def _build_controlla_report(
     if skipped:
         lines.append(f"- Saltate (mancano dati storici): {skipped}")
     if ref_temp is not None:
-        lines.append(f"- Temp riferimento: {ref_temp:.1f}C\u00b0")
-    lines.append(f"- Errore medio: {avg_err:.1f}C\u00b0")
+        lines.append(f"- Temp riferimento: {format_temp(ref_temp, prefs)}")
+    lines.append(f"- Errore medio: {format_temp_delta(avg_err, prefs)}")
     lines.append(f"- Accuratezza: {accuracy:.1f}%")
     if rain_checks:
         lines.append(f"- Pioggia corretta: {rain_hits}/{rain_checks}")
@@ -3993,7 +4589,7 @@ async def _build_controlla_report(
     if cond_checks:
         lines.append(f"- Meteo corretto: {cond_hits}/{cond_checks}")
     if wind_errs:
-        lines.append(f"- Errore vento medio: {sum(wind_errs)/len(wind_errs):.1f} km/h")
+        lines.append(f"- Errore vento medio: {format_wind(sum(wind_errs)/len(wind_errs), prefs)}")
     if humidity_errs:
         lines.append(f"- Errore umidita medio: {sum(humidity_errs)/len(humidity_errs):.1f}%")
     if pressure_errs:
@@ -4012,7 +4608,7 @@ async def _build_controlla_report(
     lines.append("Provider")
     if acc:
         for k, v in acc.items():
-            lines.append(f"- {k}: {v['accuracy']:.1f}% (avg err {v['avg_error']:.1f}C\u00b0)")
+            lines.append(f"- {k}: {v['accuracy']:.1f}% (avg err {format_temp_delta(v['avg_error'], prefs)})")
     else:
         lines.append("- nessun dato")
 
@@ -4160,13 +4756,35 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"- OpenWeather: {'OK' if OPENWEATHER_API_KEY else 'NO'}")
     lines.append(f"- WeatherAPI: {'OK' if WEATHERAPI_KEY else 'NO'}")
     lines.append(f"- Meteoblue: {'OK' if METEOBLUE_API_KEY else 'NO'}")
+    try:
+        rows = state.storage.get_provider_backoff_status()
+        if rows:
+            lines.append("")
+            lines.append("\U0001F6A6 BACKOFF PROVIDER")
+            now = now_utc()
+            for r in rows:
+                until = r["backoff_until"]
+                if not until:
+                    status = "OK"
+                else:
+                    until_dt = from_iso(until)
+                    if now >= until_dt:
+                        status = "OK"
+                    else:
+                        mins = int((until_dt - now).total_seconds() // 60)
+                        status = f"PAUSA {mins}m"
+                fail_count = int(r["fail_count"]) if r["fail_count"] is not None else 0
+                last_err = r["last_error"] or "-"
+                lines.append(f"- {r['provider']}: {status} (fail {fail_count}, last {last_err})")
+    except Exception:
+        pass
     lines.append("")
     lines.append("\U0001F4CA ACCURATEZZA PROVIDER")
     if not acc:
         lines.append("- Nessun dato ancora. Usa /meteo e poi /controlla.")
     else:
         for k, v in acc.items():
-            lines.append(f"- {k}: {v['accuracy']:.1f}% (avg err {v['avg_error']:.1f}C\u00b0)")
+            lines.append(f"- {k}: {v['accuracy']:.1f}% (avg err {format_temp_delta(v['avg_error'], None)})")
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def versione(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4221,6 +4839,7 @@ def main():
     app.add_handler(CommandHandler("pref", pref))
     app.add_handler(CommandHandler("setpref", setpref))
     app.add_handler(CommandHandler("stat", stat))
+    app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("testoffline", testoffline))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
@@ -4231,7 +4850,31 @@ def main():
         app.job_queue.run_repeating(tomorrow_rain_job, interval=20 * 60, first=180)
 
     logger.info("Bot avviato.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if WEBHOOK_URL:
+        global HEALTH_PATH_EFFECTIVE
+        if WEBHOOK_PATH == HEALTH_PATH:
+            logger.warning("HEALTH_PATH uguale a WEBHOOK_PATH, uso /health per healthcheck.")
+            health_path = "/health"
+        else:
+            health_path = HEALTH_PATH
+        HEALTH_PATH_EFFECTIVE = health_path
+        if TelegramHandler and tornado:
+            try:
+                import telegram.ext._updater as tg_updater
+                tg_updater.WebhookAppClass = CustomWebhookApp  # type: ignore
+            except Exception:
+                pass
+        webhook_url = WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
+        logger.info("Webhook attivo su %s", webhook_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_PATH.lstrip("/"),
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
