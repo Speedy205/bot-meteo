@@ -39,14 +39,23 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "Fight club")
 ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")
 HEALTH_PATH_EFFECTIVE = HEALTH_PATH
 
-BOT_VERSION = "2.7"
+BOT_VERSION = "2.8"
 BOT_RELEASES = [
+    {
+        "version": "2.8",
+        "changes": [
+            "Comando /news con changelog esteso",
+            "Aggiornamenti UX e dashboard admin",
+        ],
+    },
     {
         "version": "2.7",
         "changes": [
             "Endpoint /health per Railway/monitoraggio",
             "Comando /admin con stato completo (errori, backoff, cache)",
             "Supporto dominio webhook e path configurabili",
+            "Comando /aiuto con guida completa",
+            "Dashboard admin estesa con utenti e accuracy",
         ],
     },
     {
@@ -186,6 +195,7 @@ DAILY_CHECK_MIN = 0
 TOMORROW_RAIN_HOUR = 18
 TOMORROW_RAIN_WINDOW_MIN = 60
 OFFLINE_TEST_DAYS = 30
+MORNING_METEO_HOUR = 8
 
 DEFAULT_TEMP_UNIT = "C"
 DEFAULT_WIND_UNIT = "kmh"
@@ -3241,6 +3251,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=build_reply_keyboard())
 
 
+async def aiuto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "GUIDA BOT METEO\n\n"
+        "Cosa fa:\n"
+        "- combina piu fonti meteo per una previsione piu affidabile\n"
+        "- salva le previsioni e le confronta con i dati reali\n"
+        "- migliora i pesi dei provider nel tempo\n\n"
+        "Comandi principali:\n"
+        "- /meteo [citta] - meteo attuale\n"
+        "- /oggi - riepilogo oggi\n"
+        "- /domani - previsione domani\n"
+        "- /prev - ora per ora fino a mezzanotte\n"
+        "- /aggiorna - forza aggiornamento\n\n"
+        "Citta e preferenze:\n"
+        "- /setcitta Roma - imposta la citta\n"
+        "- /citta - lista o cambia citta\n"
+        "- /pref - mostra preferenze\n"
+        "- /setpref pop=60 vento=40 diff=3 unit=c windunit=kmh alert60=on alertdomani=on notifiche=07-22\n\n"
+        "Diagnostica:\n"
+        "- /info - stato sistema\n"
+        "- /stat - errori recenti\n"
+        "- /controlla - verifica previsioni passate\n"
+        "- /testoffline [giorni] - test su storico\n\n"
+        "Tecnologie:\n"
+        "- Python + python-telegram-bot\n"
+        "- API meteo: OpenWeather, WeatherAPI, Meteoblue\n"
+        "- Cache: RAM + SQLite\n"
+        "- Webhook (Railway) + job schedulati per alert\n\n"
+        "Affidabilita:\n"
+        "- la percentuale indica quanto le fonti concordano e quanto sono accurate storicamente\n"
+        "- cresce nel tempo con piu dati reali\n"
+    )
+    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+
+
+async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = []
+    lines.append("NEWS DEL BOT")
+    lines.append("")
+    for rel in BOT_RELEASES[:5]:
+        lines.append(f"Versione {md_escape(rel['version'])}")
+        for ch in rel["changes"]:
+            lines.append(f"- {md_escape(ch)}")
+        lines.append("")
+    lines.append("Dettagli recenti:")
+    lines.append("- webhook su Railway + /health per monitoraggio")
+    lines.append("- fallback cache anche quando le API non rispondono")
+    lines.append("- backoff automatico per provider instabili")
+    lines.append("- preferenze utente per unita e fascia notifiche")
+    lines.append("- avviso pioggia con promemoria 3h e 1h")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def comandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Comandi disponibili\n"
@@ -3260,6 +3323,8 @@ async def comandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /info - stato sistema\n"
         "- /versione - info versione bot\n"
         "- /admin <token> - stato admin (se autorizzato)\n"
+        "- /aiuto - guida completa\n"
+        "- /news - ultime novita\n"
     )
     await update.effective_message.reply_text(msg)
 
@@ -4137,16 +4202,18 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pred_total = conn.execute("SELECT COUNT(*) AS n FROM predictions").fetchone()["n"]
             pred_ok = conn.execute("SELECT COUNT(*) AS n FROM predictions WHERE verified=1").fetchone()["n"]
             err_total = conn.execute("SELECT COUNT(*) AS n FROM errors_log").fetchone()["n"]
+            users_count = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
         db_size_kb = int(os.path.getsize(DB_FILE) / 1024) if os.path.exists(DB_FILE) else 0
         lines.append("DB")
         lines.append(f"- Cache: {cache_count}")
         lines.append(f"- Predizioni: {pred_total} (verificate {pred_ok})")
         lines.append(f"- Errori totali: {err_total}")
+        lines.append(f"- Utenti: {users_count}")
         lines.append(f"- DB size: {db_size_kb} KB")
     except Exception:
         pass
 
-    rows = state.storage.get_recent_errors(5)
+    rows = state.storage.get_recent_errors(10)
     lines.append("")
     lines.append("Errori recenti")
     if not rows:
@@ -4182,6 +4249,15 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"- {r['provider']}: {status} (fail {fail_count}, last {last_err})")
     except Exception:
         pass
+
+    lines.append("")
+    lines.append("Provider accuracy")
+    acc = state.storage.get_provider_accuracy()
+    if not acc:
+        lines.append("- nessun dato")
+    else:
+        for k, v in acc.items():
+            lines.append(f"- {k}: {v['accuracy']:.1f}% (avg err {format_temp_delta(v['avg_error'], None)})")
 
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -4255,6 +4331,23 @@ def _alert_ready(storage: Storage, user_id: int, alert_type: str) -> bool:
     return (now_utc() - last) >= timedelta(minutes=ALERT_COOLDOWN_MIN)
 
 
+async def _send_rain_alert(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    if not job:
+        return
+    data = job.data or {}
+    user_id = data.get("user_id")
+    text = data.get("text")
+    alert_type = data.get("alert_type")
+    if not user_id or not text or not alert_type:
+        return
+    state: AppState = context.application.bot_data["state"]
+    if not _alert_ready(state.storage, int(user_id), alert_type):
+        return
+    await context.bot.send_message(chat_id=int(user_id), text=text)
+    state.storage.set_last_alert(int(user_id), alert_type, now_utc())
+
+
 async def _get_forecast_cached(state: AppState, lat: float, lon: float) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     ck = key_forecast(lat, lon, 0)
     cached = state.ram_cache.get(ck) or state.storage.cache_get(ck)
@@ -4313,6 +4406,37 @@ async def _get_current_fused_cached(state: AppState, lat: float, lon: float, coo
     weights_ctx = adaptive_weights(weights, diff, err_ow, err_wa)
     weights_ctx["Meteoblue"] = float(weights.get("Meteoblue", 0.0))
     return state.weather.fuse(ow_cur, wa_cur, mb_cur, bias=bias_ctx, weights_override=weights_ctx)
+
+
+def _schedule_rain_alerts(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    city_name: str,
+    rain_period: Dict[str, Any],
+    tz_offset: int,
+):
+    job_queue = context.application.job_queue if context and context.application else None
+    if not job_queue:
+        return
+    start_local = rain_period["start"]
+    start_utc = start_local.astimezone(timezone.utc)
+    now = now_utc()
+    offsets = [("rain_3h", 3), ("rain_1h", 1)]
+    for key, hours in offsets:
+        when = start_utc - timedelta(hours=hours)
+        if when <= now:
+            continue
+        alert_type = f"{key}_{start_local.date().isoformat()}"
+        state: AppState = context.application.bot_data["state"]
+        if not _alert_ready(state.storage, user_id, alert_type):
+            continue
+        text = f"Pioggia prevista a {city_name} tra {rain_period['start'].strftime('%H:%M')}-{rain_period['end'].strftime('%H:%M')}: avviso {hours}h prima"
+        job_queue.run_once(
+            _send_rain_alert,
+            when=when,
+            data={"user_id": user_id, "text": text, "alert_type": alert_type},
+            name=f"{alert_type}_{user_id}",
+        )
 
 
 async def _check_alerts_for_user(state: AppState, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -4720,7 +4844,7 @@ async def tomorrow_rain_job(context: ContextTypes.DEFAULT_TYPE):
             tz = tzinfo_from_offset(tz_offset)
             if last and last.astimezone(tz).date() == now_local.date():
                 continue
-            _, _, _, points_ow, points_wa, points_mb, fused_points, target_date, _, _, _ = await _load_forecast_points(
+            _, _, _, points_ow, points_wa, points_mb, fused_points, target_date, _, _, _, _, _ = await _load_forecast_points(
                 state, coords, 1
             )
             if not fused_points:
@@ -4739,6 +4863,76 @@ async def tomorrow_rain_job(context: ContextTypes.DEFAULT_TYPE):
             state.storage.set_last_alert(user_id, "tomorrow_rain", now_utc())
         except Exception as exc:
             logger.error(f"Tomorrow rain error for user {uid}: {exc}")
+
+
+async def morning_meteo_job(context: ContextTypes.DEFAULT_TYPE):
+    state: AppState = context.application.bot_data["state"]
+    users = state.storage.get_all_users()
+    for uid in users:
+        try:
+            user_id = int(uid)
+            city = state.storage.get_user_city(user_id)
+            if not city:
+                continue
+            coords = await get_coords(state, city)
+            if not coords:
+                continue
+            tz_offset = get_tz_offset_sec(None, None, None, coords=coords)
+            now_local = local_now(tz_offset)
+            if now_local.hour != MORNING_METEO_HOUR:
+                continue
+            tz = tzinfo_from_offset(tz_offset)
+            last = state.storage.get_last_alert(user_id, "morning_meteo")
+            if last and last.astimezone(tz).date() == now_local.date():
+                continue
+            forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, _, sources_label, cached_used, cache_stale, cache_age_min = await _load_forecast_points(
+                state, coords, 0
+            )
+            if not fused_points:
+                continue
+            ths = get_dynamic_thresholds(state.storage)
+            prefs = state.storage.get_user_prefs(user_id)
+            rain_periods = compute_rain_periods_threshold(fused_points, ths.get("pop", RAIN_POP_THRESHOLD))
+            max_pop = max((float(p.get("pop", 0)) for p in fused_points), default=0)
+            rain_msg = summarize_rain_forecast(rain_periods, max_pop, now_local, False)
+            min_t, max_t = extract_min_max(fused_points)
+            enabled = [p for p, k in [("OpenWeather", OPENWEATHER_API_KEY), ("WeatherAPI", WEATHERAPI_KEY), ("Meteoblue", METEOBLUE_API_KEY)] if k]
+            sources = []
+            if points_ow:
+                sources.append("OpenWeather")
+            if points_wa:
+                sources.append("WeatherAPI")
+            if points_mb:
+                sources.append("Meteoblue")
+            correction_used = False
+            sources_label = format_sources_label(sources, correction_used, [p for p in enabled if p not in sources])
+            fallback_note = build_provider_note(enabled, sources, cache_stale=cache_stale, cache_age_min=cache_age_min)
+            fused = await _get_current_fused_cached(state, coords["lat"], coords["lon"], coords)
+            if not fused:
+                continue
+            msg = format_meteo_message(
+                fused,
+                coords["name"],
+                coords["country"],
+                min_t,
+                max_t,
+                rain_msg,
+                sources_label,
+                cache_age_min,
+                now_local,
+                None,
+                fallback_note,
+                None,
+                prefs=prefs,
+                cache_stale=cache_stale,
+            )
+            await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
+            state.storage.set_last_alert(user_id, "morning_meteo", now_utc())
+
+            if rain_periods:
+                _schedule_rain_alerts(context, user_id, coords["name"], rain_periods[0], tz_offset)
+        except Exception as exc:
+            logger.error(f"Morning meteo error for user {uid}: {exc}")
 
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4855,10 +5049,12 @@ def main():
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("versione", versione))
     app.add_handler(CommandHandler("versioni", versione))
+    app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler("pref", pref))
     app.add_handler(CommandHandler("setpref", setpref))
     app.add_handler(CommandHandler("stat", stat))
     app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("aiuto", aiuto))
     app.add_handler(CommandHandler("testoffline", testoffline))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
@@ -4867,6 +5063,7 @@ def main():
         app.job_queue.run_repeating(check_alerts_job, interval=ALERT_CHECK_MIN * 60, first=60)
         app.job_queue.run_repeating(daily_check_job, interval=20 * 60, first=120)
         app.job_queue.run_repeating(tomorrow_rain_job, interval=20 * 60, first=180)
+        app.job_queue.run_repeating(morning_meteo_job, interval=60 * 60, first=240)
 
     logger.info("Bot avviato.")
     if WEBHOOK_URL:
