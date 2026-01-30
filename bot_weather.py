@@ -3290,17 +3290,10 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     lines.append("NEWS DEL BOT")
     lines.append("")
-    for rel in BOT_RELEASES[:5]:
-        lines.append(f"Versione {md_escape(rel['version'])}")
-        for ch in rel["changes"]:
-            lines.append(f"- {md_escape(ch)}")
-        lines.append("")
-    lines.append("Dettagli recenti:")
-    lines.append("- webhook su Railway + /health per monitoraggio")
-    lines.append("- fallback cache anche quando le API non rispondono")
-    lines.append("- backoff automatico per provider instabili")
-    lines.append("- preferenze utente per unita e fascia notifiche")
-    lines.append("- avviso pioggia con promemoria 3h e 1h")
+    rel = BOT_RELEASES[0] if BOT_RELEASES else {"version": BOT_VERSION, "changes": []}
+    lines.append(f"Versione {md_escape(rel['version'])}")
+    for ch in rel.get("changes", []):
+        lines.append(f"- {md_escape(ch)}")
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
