@@ -248,8 +248,9 @@ ADMIN_IDS_SET = _parse_admin_ids(ADMIN_USER_IDS)
 def is_admin(user_id: int, token: Optional[str] = None) -> bool:
     if ADMIN_IDS_SET and user_id in ADMIN_IDS_SET:
         return True
-    if ADMIN_SECRET and token and token == ADMIN_SECRET:
-        return True
+    if ADMIN_SECRET and token:
+        if token.strip().lower() == ADMIN_SECRET.strip().lower():
+            return True
     return False
 
 class HealthHandler(tornado.web.RequestHandler if tornado else object):
@@ -3691,6 +3692,7 @@ async def _load_forecast_points(
         forecast_wa = cached.get("forecast_wa")
         forecast_mb = cached.get("forecast_mb")
         cached_used = True
+        cache_age_min = cache_age_min_from_payload(cached, None)
     else:
         cached_meta, created_at, _, expired = state.storage.cache_get_with_meta(ck, allow_expired=True)
         if cached_meta and not expired:
@@ -3699,6 +3701,7 @@ async def _load_forecast_points(
             forecast_mb = cached_meta.get("forecast_mb")
             cached_used = True
             state.ram_cache.set(ck, cached_meta, ttl_seconds=30)
+            cache_age_min = cache_age_min_from_payload(cached_meta, created_at)
         elif cached_meta and expired:
             stale_payload = cached_meta
             stale_created_at = created_at
@@ -3827,7 +3830,12 @@ async def _forecast_common(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         await update.effective_message.reply_text("Nessuna previsione disponibile")
         return
     if cached_used:
-        cache_line = "\nDato: Cache (stale)" if cache_stale else "\nDato: Cache"
+        if cache_age_min is not None:
+            cache_line = f"\nDato: Cache {cache_age_min}m"
+            if cache_stale:
+                cache_line += " (stale)"
+        else:
+            cache_line = "\nDato: Cache (stale)" if cache_stale else "\nDato: Cache"
         await update.effective_message.reply_text(msg + cache_line, parse_mode="Markdown")
     else:
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
@@ -3866,7 +3874,7 @@ async def oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(MSG_CITY_NOT_FOUND)
         return
 
-    forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used, cache_stale, _ = await _load_forecast_points(
+    forecast_ow, forecast_wa, forecast_mb, points_ow, points_wa, points_mb, fused_points, target_date, tz_offset, sources_label, cached_used, cache_stale, cache_age_min = await _load_forecast_points(
         state, coords, 0
     )
     if not forecast_ow and not forecast_wa and not forecast_mb:
@@ -3897,7 +3905,12 @@ async def oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Nessuna previsione disponibile")
         return
     if cached_used:
-        msg += "\nDato: Cache"
+        if cache_age_min is not None:
+            msg += f"\nDato: Cache {cache_age_min}m"
+            if cache_stale:
+                msg += " (stale)"
+        else:
+            msg += "\nDato: Cache (stale)" if cache_stale else "\nDato: Cache"
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
     # ACCURACY: salva ogni slot previsto
@@ -3987,7 +4000,13 @@ async def prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if fallback_note:
         lines.append(f"Nota: {fallback_note}")
     if cached_used:
-        lines.append("Dato: Cache (stale)" if cache_stale else "Dato: Cache")
+        if cache_age_min is not None:
+            cache_line = f"Dato: Cache {cache_age_min}m"
+            if cache_stale:
+                cache_line += " (stale)"
+            lines.append(cache_line)
+        else:
+            lines.append("Dato: Cache (stale)" if cache_stale else "Dato: Cache")
 
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -4098,7 +4117,7 @@ async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = context.args[0] if context.args else None
+    token = " ".join(context.args) if context.args else None
     uid = update.effective_user.id
     if not ADMIN_SECRET and not ADMIN_IDS_SET:
         await update.effective_message.reply_text("Admin non configurato. Imposta ADMIN_SECRET o ADMIN_USER_IDS.")
@@ -4861,9 +4880,13 @@ def main():
         if TelegramHandler and tornado:
             try:
                 import telegram.ext._updater as tg_updater
+                import telegram.ext._utils.webhookhandler as webhookhandler
                 tg_updater.WebhookAppClass = CustomWebhookApp  # type: ignore
+                webhookhandler.WebhookAppClass = CustomWebhookApp  # type: ignore
             except Exception:
-                pass
+                logger.warning("Impossibile registrare /health nel webhook server.")
+        else:
+            logger.warning("Webhook attivo senza /health (tornado non disponibile).")
         webhook_url = WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
         logger.info("Webhook attivo su %s", webhook_url)
         app.run_webhook(
