@@ -380,6 +380,22 @@ def get_rain_risk_icon(
     return ""
 
 
+def rain_risk_label(pop: Optional[float]) -> Optional[str]:
+    if pop is None:
+        return None
+    try:
+        pop_val = float(pop)
+    except Exception:
+        return None
+    if pop_val < 20:
+        return "nessuno"
+    if pop_val < 40:
+        return "basso"
+    if pop_val < 60:
+        return "medio"
+    return "alto"
+
+
 METEOBLUE_PICTO_HOURLY: Dict[int, str] = {
     1: "Clear, cloudless sky",
     2: "Clear, few cirrus",
