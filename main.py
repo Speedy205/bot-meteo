@@ -7,7 +7,7 @@ from app_state import AppState, _on_shutdown
 from commands import (
     admin, aggiorna, aiuto, citta, comandi, controlla, delcitta, domani, handle_callback,
     handle_text_buttons, info, meteo, mycitta, news, oggi, pref, prev, setcitta, setpref,
-    start, stat, testoffline, versione
+    start, stat, testoffline, trend, versione
 )
 import config as config_module
 from config import (
@@ -48,6 +48,7 @@ def main():
     app.add_handler(CommandHandler("aggiorna", aggiorna))
     app.add_handler(CommandHandler("oggi", oggi))
     app.add_handler(CommandHandler("prev", prev))
+    app.add_handler(CommandHandler("trend", trend))
     app.add_handler(CommandHandler("domani", domani))
     app.add_handler(CommandHandler("controlla", controlla))
     app.add_handler(CommandHandler("comandi", comandi))
