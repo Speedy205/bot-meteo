@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +16,7 @@ from config import (
     ADMIN_SECRET, ADMIN_USER_IDS, ALERT_CHECK_MIN, ALERT_COOLDOWN_MIN, ALERT_POP_THRESHOLD,
     ALERT_TEMP_COLD, ALERT_TEMP_HOT, ALERT_WIND_KPH, BOT_RELEASES, BOT_VERSION,
     CACHE_TTL_CURRENT_MIN, CACHE_TTL_FORECAST_MIN, DAILY_CHECK_HOUR, DAILY_CHECK_MIN,
+    DB_FILE,
     DEFAULT_ALERT_END_HOUR, DEFAULT_ALERT_START_HOUR, DEFAULT_TEMP_UNIT, DEFAULT_WIND_UNIT,
     FEELS_LIKE_DIFF_C, HEALTH_PATH, HEALTH_PATH_EFFECTIVE, METEOBLUE_API_KEY, MORNING_METEO_HOUR,
     MSG_CITY_NOT_FOUND, MSG_NEED_CITY, MSG_SERVICE_UNAVAILABLE, OFFLINE_TEST_DAYS, OPENWEATHER_API_KEY,
@@ -25,6 +27,7 @@ from forecast import (
     apply_pop_calibration, build_fused_points, build_pop_calibrator, compute_rain_periods_threshold,
     extract_day_points, extract_day_points_meteoblue, extract_day_points_weatherapi,
     extract_day_points_weatherapi_history, extract_min_max, get_dynamic_thresholds,
+    interpolate_hourly_points,
     key_current, key_forecast, pick_point_for_hour, summarize_rain_forecast
 )
 from formatting import (
@@ -35,12 +38,14 @@ from formatting import (
 )
 from geo import get_coords
 from providers import ProviderResult
+from storage import Storage
 from utils import (
     ADMIN_IDS_SET, BOT_STARTED_AT_UTC, adaptive_weights, build_provider_note, cache_age_min_from_payload, clamp,
     condition_group_from_description, condition_group_from_icon, format_alert_window,
     format_date_italian, format_temp, format_temp_delta, format_time_italian, format_uptime,
-    format_wind, from_iso, get_rain_risk_icon, get_tz_offset_sec, get_weather_icon, hour_band, is_admin, is_rain_description,
-    local_now, log_event, md_escape, now_utc, season_from_date, tzinfo_from_offset,
+    format_wind, forecast_ttl_minutes, from_iso, get_rain_risk_icon, get_tz_offset_sec, get_weather_icon,
+    hour_band, is_admin, is_rain_description, iso, local_now, log_event, md_escape, normalize_temp_unit,
+    normalize_wind_unit, now_utc, parse_alert_window, season_from_date, tzinfo_from_offset,
     within_alert_window, zone_bucket, logger
 )
 async def _call_with_args(fn, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]):
