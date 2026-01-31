@@ -52,7 +52,7 @@ class Config:
     admin_user_ids: str = ""
 
     # Versions / releases
-    bot_version: str = "2.9"
+    bot_version: str = "3.0"
     bot_releases: List[Dict[str, Any]] = field(default_factory=list)
 
     # Storage / HTTP
@@ -184,6 +184,14 @@ HEALTH_PATH_EFFECTIVE = HEALTH_PATH
 
 BOT_VERSION = config.bot_version
 BOT_RELEASES = config.bot_releases or [
+    {
+        "version": "3.0",
+        "changes": [
+            "Riga rischio pioggia (basso/medio/alto) nelle previsioni",
+            "Nuovo comando /trend con riassunto rapido giornata",
+            "Admin con parametri, pesi e bias provider",
+        ],
+    },
     {
         "version": "2.9",
         "changes": [
