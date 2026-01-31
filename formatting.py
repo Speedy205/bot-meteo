@@ -11,7 +11,8 @@ from providers import ProviderResult
 from storage import Storage
 from utils import (
     clamp, condition_group_from_icon, format_date_italian, format_temp, format_time_italian, format_wind,
-    get_rain_risk_icon, get_weather_icon, hour_band, humanize_description, md_escape, season_from_date, zone_bucket
+    get_rain_risk_icon, get_weather_icon, hour_band, humanize_description, md_escape, rain_risk_label,
+    season_from_date, zone_bucket
 )
 
 def format_meteo_message(
@@ -48,6 +49,7 @@ def format_meteo_message(
         icon_code=fused.get("icon"),
         description=fused.get("description"),
     )
+    rain_risk = rain_risk_label(rain_pop)
     if rain_icon and icon in {"\U0001F327\ufe0f", "\U0001F326\ufe0f", "\u26c8\ufe0f"}:
         rain_icon = ""
     date_label = format_date_italian(local_dt)
@@ -72,6 +74,8 @@ def format_meteo_message(
         f"\U0001F321 Ora: {format_temp(fused.get('temp'), prefs)} (Percepita {format_temp(fused.get('feels_like'), prefs)})",
         cond_line,
     ]
+    if rain_risk:
+        lines.append(f"Rischio pioggia: {rain_risk}")
     if rain_msg:
         if rain_icon:
             lines.append(f"{rain_icon} Pioggia: {rain_msg}")
@@ -224,6 +228,10 @@ def format_forecast_message(
     lines.append("")
     if min_t is not None and max_t is not None:
         lines.append(f"Min/Max: {format_temp(min_t, prefs)} / {format_temp(max_t, prefs)}")
+    max_pop = max((float(p.get("pop", 0)) for p in points), default=None)
+    rain_risk = rain_risk_label(max_pop)
+    if rain_risk:
+        lines.append(f"Rischio pioggia: {rain_risk}")
     lines.append("Orari (1h):" if days == 1 else "Orari (3h):")
     for p in chosen:
         hour = int(p["ora"].split(":")[0])
