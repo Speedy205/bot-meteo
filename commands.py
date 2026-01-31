@@ -45,7 +45,7 @@ from utils import (
     format_date_italian, format_temp, format_temp_delta, format_time_italian, format_uptime,
     format_wind, forecast_ttl_minutes, from_iso, get_rain_risk_icon, get_tz_offset_sec, get_weather_icon,
     hour_band, is_admin, is_rain_description, iso, local_now, log_event, md_escape, normalize_temp_unit,
-    normalize_wind_unit, now_utc, parse_alert_window, season_from_date, tzinfo_from_offset,
+    normalize_wind_unit, now_utc, parse_alert_window, rain_risk_label, season_from_date, tzinfo_from_offset,
     within_alert_window, zone_bucket, logger
 )
 async def _call_with_args(fn, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]):
@@ -73,6 +73,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /oggi\n"
         "- /domani\n"
         "- /prev\n"
+        "- /trend\n"
         "- /setcitta\n"
         "- /citta\n"
         "- /aggiorna\n\n"
@@ -94,6 +95,7 @@ async def aiuto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /oggi - riepilogo oggi\n"
         "- /domani - previsione domani\n"
         "- /prev - ora per ora fino a mezzanotte\n"
+        "- /trend - riassunto rapido giornata\n"
         "- /aggiorna - forza aggiornamento\n\n"
         "Citta e preferenze:\n"
         "- /setcitta Roma - imposta la citta\n"
@@ -136,6 +138,7 @@ async def comandi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /oggi - riepilogo giornata\n"
         "- /prev - ora per ora fino a mezzanotte\n"
         "- /domani - previsioni domani\n"
+        "- /trend - riassunto rapido giornata\n"
         "- /setcitta - salva e imposta citta\n"
         "- /citta - lista o cambia citta\n"
         "- /delcitta - rimuove citta\n"
@@ -823,6 +826,68 @@ async def oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state: AppState = context.application.bot_data["state"]
+
+    if context.args:
+        city = " ".join(context.args)
+    else:
+        city = state.storage.get_user_city(update.effective_user.id)
+        if not city:
+            await update.effective_message.reply_text(MSG_NEED_CITY)
+            return
+
+    coords = await get_coords(state, city)
+    if not coords:
+        await update.effective_message.reply_text(MSG_CITY_NOT_FOUND)
+        return
+
+    forecast_ow, forecast_wa, forecast_mb, _, _, _, fused_points, target_date, tz_offset, _, _, _, _ = await _load_forecast_points(
+        state, coords, 0
+    )
+    if not forecast_ow and not forecast_wa and not forecast_mb:
+        await update.effective_message.reply_text(MSG_SERVICE_UNAVAILABLE)
+        return
+    if not fused_points:
+        await update.effective_message.reply_text("Nessuna previsione disponibile")
+        return
+
+    def _avg(vals: List[float]) -> Optional[float]:
+        return sum(vals) / len(vals) if vals else None
+
+    points_today = [p for p in fused_points if p["local_time"].date() == target_date]
+    early = [p["temp"] for p in points_today if 6 <= p["local_time"].hour <= 11]
+    late = [p["temp"] for p in points_today if 12 <= p["local_time"].hour <= 18]
+    if not early:
+        early = [p["temp"] for p in points_today[:6]]
+    if not late:
+        late = [p["temp"] for p in points_today[-6:]]
+    early_avg = _avg(early)
+    late_avg = _avg(late)
+    if early_avg is None or late_avg is None:
+        temp_trend = "n/d"
+    else:
+        delta = late_avg - early_avg
+        if delta > 1.0:
+            temp_trend = "in aumento"
+        elif delta < -1.0:
+            temp_trend = "in diminuzione"
+        else:
+            temp_trend = "stabile"
+
+    ths = get_dynamic_thresholds(state.storage)
+    max_pop = max((float(p.get("pop", 0)) for p in points_today), default=0)
+    rain_yes = "si" if max_pop >= float(ths.get("pop", RAIN_POP_THRESHOLD)) else "no"
+    risk = rain_risk_label(max_pop) or "n/d"
+
+    name_md = md_escape(coords.get("name", ""))
+    line = (
+        f"Trend oggi a {name_md}: temperatura {temp_trend}, "
+        f"pioggia {rain_yes} (max {max_pop:.0f}%, rischio {risk})."
+    )
+    await update.effective_message.reply_text(line, parse_mode="Markdown")
+
+
 async def prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state: AppState = context.application.bot_data["state"]
 
@@ -860,6 +925,13 @@ async def prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"{name_md}, {country_md}")
     lines.append(f"{format_date_italian(datetime.combine(target_date, datetime.min.time()))}")
     lines.append(f"Da {start_hour:02d}:00 a 23:00")
+    max_pop = max(
+        (float(p.get("pop", 0)) for p in fused_points if p["local_time"].hour >= start_hour),
+        default=None,
+    )
+    rain_risk = rain_risk_label(max_pop)
+    if rain_risk:
+        lines.append(f"Rischio pioggia: {rain_risk}")
     lines.append("")
 
     prefs = state.storage.get_user_prefs(update.effective_user.id)
@@ -1045,6 +1117,46 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    try:
+        lines.append("")
+        lines.append("Cache RAM")
+        lines.append(f"- Items: {len(state.ram_cache.data)} (max {state.ram_cache.max_items})")
+    except Exception:
+        pass
+
+    try:
+        ths = get_dynamic_thresholds(state.storage)
+        lines.append("")
+        lines.append("Parametri")
+        lines.append(f"- POP base/dinamico: {RAIN_POP_THRESHOLD}% / {ths.get('pop', RAIN_POP_THRESHOLD):.0f}%")
+        lines.append(f"- Vento forte base/dinamico: {WIND_STRONG_KPH} / {ths.get('wind', WIND_STRONG_KPH):.0f} km/h")
+        lines.append(f"- Ombrello: {UMBRELLA_POP_THRESHOLD}%")
+        lines.append(f"- Percepita diff: {FEELS_LIKE_DIFF_C}C")
+        lines.append(f"- TTL cache current/forecast: {CACHE_TTL_CURRENT_MIN}m / {CACHE_TTL_FORECAST_MIN}m")
+    except Exception:
+        pass
+
+    try:
+        weights = state.weather.get_dynamic_weights()
+        lines.append("")
+        lines.append("Pesi provider")
+        for k, v in weights.items():
+            lines.append(f"- {k}: {float(v):.2f}")
+    except Exception:
+        pass
+
+    try:
+        bias = state.storage.get_provider_bias()
+        lines.append("")
+        lines.append("Bias provider")
+        if not bias:
+            lines.append("- nessun dato")
+        else:
+            for k, v in bias.items():
+                lines.append(f"- {k}: {float(v):+.2f}C")
+    except Exception:
+        pass
+
     rows = state.storage.get_recent_errors(10)
     lines.append("")
     lines.append("Errori recenti")
@@ -1146,6 +1258,8 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _call_with_args(oggi, update, context, [])
     elif text == "domani":
         await _call_with_args(domani, update, context, [])
+    elif text == "trend":
+        await _call_with_args(trend, update, context, [])
     elif text == "dettagli":
         await _call_with_args(meteo, update, context, ["dettagli"])
     elif text == "aggiorna":
